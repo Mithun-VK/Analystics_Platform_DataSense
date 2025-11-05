@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "noEmit": false,
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "allowJs": true,
+    "lib": ["ES2020"],
+    "target": "ES2020",
+    "forceConsistentCasingInFileNames": true,
+    "declaration": true,
+    "sourceMap": false,
+    "outDir": "./dist"
+  },
+  "include": [
+    "vite.config.ts",
+    "vitest.config.ts",
+    "postcss.config.js",
+    "tailwind.config.js",
+    ".eslintrc.cjs",
+    ".prettierrc.cjs"
+  ],
+  "exclude": ["node_modules", "src"]
+}
