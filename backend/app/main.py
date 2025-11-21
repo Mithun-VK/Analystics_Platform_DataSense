@@ -1,4 +1,4 @@
-# backend/app/main.py - COMPLETE FIXED VERSION (OPTIONS IN MAIN.PY)
+# backend/app/main.py
 
 """
 FastAPI Application Entry Point.
@@ -44,25 +44,19 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info(f"🚀 Starting {settings.PROJECT_NAME} v{settings.VERSION}")
     logger.info(f"   Environment: {settings.ENVIRONMENT}")
-    
     try:
         startup_db()
-        
         if not check_db_connection():
             logger.error("❌ Database health check failed")
             raise RuntimeError("Database connection failed")
-        
         logger.info(f"   Debug mode: {settings.DEBUG}")
         logger.info(f"   API prefix: {settings.API_V1_STR}")
         logger.info(f"   CORS origins: {settings.BACKEND_CORS_ORIGINS}")
         logger.info("✅ Application startup complete\n")
-        
     except Exception as e:
         logger.error(f"❌ Startup failed: {str(e)}")
         raise
-    
     yield
-    
     # Shutdown
     logger.info("\n🛑 Shutting down application...")
     try:
@@ -124,18 +118,16 @@ async def log_requests(request: Request, call_next):
     """Log all requests and responses."""
     start_time = time.time()
     client_ip = request.client.host if request.client else "unknown"
-    
     logger.info(f"📨 Request: {request.method} {request.url.path} from {client_ip}")
-    
+
     try:
         response = await call_next(request)
     except Exception as e:
         logger.error(f"❌ Request failed: {str(e)}")
         raise
-    
+
     duration = time.time() - start_time
     status_code = response.status_code
-    
     if 200 <= status_code < 300:
         status_emoji = "✅"
     elif 300 <= status_code < 400:
@@ -144,28 +136,26 @@ async def log_requests(request: Request, call_next):
         status_emoji = "⚠️"
     else:
         status_emoji = "❌"
-    
+
     logger.info(
         f"{status_emoji} Response: {status_code} "
         f"for {request.method} {request.url.path} ({duration:.3f}s)"
     )
-    
+
     response.headers["X-Process-Time"] = str(duration)
     response.headers["X-API-Version"] = settings.VERSION
-    
+
     return response
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     """Add security headers to responses."""
     response = await call_next(request)
-    
     if settings.is_production:
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    
     return response
 
 # ============================================================
@@ -174,12 +164,6 @@ async def add_security_headers(request: Request, call_next):
 
 @app.options("/{full_path:path}", include_in_schema=False)
 async def options_handler(full_path: str) -> Response:
-    """
-    ✅ CRITICAL: Global handler for CORS preflight (OPTIONS) requests.
-    
-    This catches ALL OPTIONS requests before they reach route handlers.
-    Returns 200 OK immediately without validation.
-    """
     logger.debug(f"✅ Preflight request: OPTIONS /{full_path}")
     return Response(
         status_code=200,
@@ -194,12 +178,10 @@ async def options_handler(full_path: str) -> Response:
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-    """Handle HTTP exceptions."""
     logger.warning(
         f"⚠️  HTTP {exc.status_code}: {exc.detail} "
         f"for {request.method} {request.url.path}"
     )
-    
     return JSONResponse(
         status_code=exc.status_code,
         content=ErrorResponse(
@@ -211,17 +193,14 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Handle request validation errors."""
     errors = []
     for error in exc.errors():
         field = " -> ".join(str(loc) for loc in error["loc"])
         message = error["msg"]
         errors.append(f"{field}: {message}")
-    
     logger.warning(
         f"❌ Validation error for {request.method} {request.url.path}: {errors}"
     )
-    
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content=ErrorResponse(
@@ -234,17 +213,14 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    """Handle unexpected exceptions."""
     logger.error(
         f"❌ Unexpected error for {request.method} {request.url.path}: {str(exc)}",
         exc_info=True
     )
-    
     if settings.is_production:
         message = "An internal server error occurred"
     else:
         message = str(exc)
-    
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content=ErrorResponse(
@@ -260,7 +236,6 @@ async def general_exception_handler(request: Request, exc: Exception):
 
 @app.get("/", tags=["Root"])
 async def root() -> dict[str, Any]:
-    """Root endpoint."""
     return {
         "name": settings.PROJECT_NAME,
         "version": settings.VERSION,
@@ -271,18 +246,14 @@ async def root() -> dict[str, Any]:
 
 @app.get("/health", tags=["Health"])
 async def health_check() -> dict[str, Any]:
-    """Health check endpoint."""
     db_healthy = check_db_connection()
-    
     health_status = {
         "status": "healthy" if db_healthy else "unhealthy",
         "database": {"connected": db_healthy},
         "environment": settings.ENVIRONMENT,
         "version": settings.VERSION,
     }
-    
     status_code = status.HTTP_200_OK if db_healthy else status.HTTP_503_SERVICE_UNAVAILABLE
-    
     return JSONResponse(
         status_code=status_code,
         content=health_status
@@ -290,7 +261,6 @@ async def health_check() -> dict[str, Any]:
 
 @app.get("/info", tags=["Info"])
 async def info() -> dict[str, Any]:
-    """System information endpoint."""
     return {
         "project": settings.PROJECT_NAME,
         "version": settings.VERSION,
@@ -312,14 +282,11 @@ logger.info("📋 Registering API routes...")
 
 try:
     from app.api.v1.api import api_router
-    
     app.include_router(api_router)
-    
     logger.info("✅ API v1 router registered successfully")
     logger.info("   ├── With all endpoint groups")
     logger.info("   ├── Global OPTIONS handler active")
     logger.info("   └── Ready to accept requests\n")
-
 except Exception as e:
     logger.error(f"❌ Failed to register API router: {str(e)}", exc_info=True)
     raise
@@ -330,7 +297,6 @@ except Exception as e:
 
 @app.on_event("startup")
 async def startup_message():
-    """Print startup banner."""
     banner = f"""
     ╔════════════════════════════════════════════════════════════╗
     ║                                                            ║
@@ -353,9 +319,7 @@ async def startup_message():
 # ============================================================
 
 if __name__ == "__main__":
-    """Run application directly for development."""
     import uvicorn
-    
     uvicorn.run(
         "app.main:app",
         host=settings.HOST,

@@ -102,6 +102,17 @@ except Exception as e:
     HAS_VISUALIZATIONS = False
     logger.error(f"❌ Error loading visualizations endpoints: {e}", exc_info=True)
 
+try:
+    from app.api.v1.endpoints import analytics
+    HAS_ANALYTICS = True
+    logger.info("✅ Analytics endpoints loaded")
+except ImportError as e:
+    HAS_ANALYTICS = False
+    logger.warning(f"⚠️  Analytics endpoints not loaded: {e}")
+except Exception as e:
+    HAS_ANALYTICS = False
+    logger.error(f"❌ Error loading analytics endpoints: {e}", exc_info=True)
+
 # ============================================================
 # REGISTER ENDPOINT ROUTERS
 # ============================================================
@@ -162,6 +173,14 @@ if HAS_VISUALIZATIONS:
     )
     logger.info("✅ Visualizations routes registered at /api/v1/visualizations")
 
+if HAS_ANALYTICS:
+    api_router.include_router(
+        analytics.router,
+        prefix="/analytics",
+        tags=["Analytics"]
+    )
+    logger.info("✅ Analytics routes registered at /api/v1/analytics")
+
 # ============================================================
 # ROUTER SUMMARY
 # ============================================================
@@ -173,7 +192,8 @@ enabled_count = sum([
     HAS_CLEANING,
     HAS_EDA,
     HAS_INSIGHTS,
-    HAS_VISUALIZATIONS
+    HAS_VISUALIZATIONS,
+    HAS_ANALYTICS 
 ])
 
 logger.info(f"\n📊 API Router Summary: {enabled_count}/7 endpoint groups loaded")

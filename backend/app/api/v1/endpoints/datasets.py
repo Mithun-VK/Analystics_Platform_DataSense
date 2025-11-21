@@ -51,106 +51,61 @@ router = APIRouter()
     "/upload",
     response_model=SuccessResponse[DatasetResponse],
     status_code=status.HTTP_201_CREATED,
-    summary="Upload Dataset",
-    description="Upload a new dataset file (CSV, Excel, JSON, or Parquet)."
+    summary="Upload Analytics Dataset (multi-file)",
+    description="Upload four analytics (orders, customers, products, marketing) CSV files."
 )
 async def upload_dataset(
-    file: UploadFile = File(..., description="Dataset file to upload"),
+    orders_file: UploadFile = File(..., description="Orders CSV"),
+    customers_file: UploadFile = File(..., description="Customers CSV"),
+    products_file: UploadFile = File(..., description="Products CSV"),
+    marketing_file: UploadFile = File(..., description="Marketing CSV"),
     name: str = Form(..., description="Dataset name", min_length=1, max_length=255),
     description: Optional[str] = Form(None, description="Dataset description", max_length=2000),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_verified_user),
     dataset_service: DatasetService = Depends(get_dataset_service),
-) -> Any:
+) -> SuccessResponse:
     """
-    Upload a new dataset file.
-    
-    **Supported Formats:**
-    - CSV (.csv)
-    - Excel (.xlsx, .xls)
-    - JSON (.json)
-    - Parquet (.parquet)
-    
-    **File Size Limits:**
-    - Free tier: 10 MB
-    - Premium tier: 500 MB
-    
-    **Process:**
-    1. Validates file type and size
-    2. Checks user's upload limits
-    3. Saves file securely
-    4. Extracts metadata
-    5. Triggers background processing
-    
-    **Returns:**
-    - Dataset object with initial metadata
-    - Processing status (will be updated async)
-    
-    **Errors:**
-    - 400: Invalid file type or size
-    - 403: User quota exceeded
-    - 413: File too large
-    - 422: Validation error
+    Upload a new analytics dataset via four CSV files (orders, customers, products, marketing).
     """
     try:
-        logger.info(f"Dataset upload initiated by user {current_user.id}: {name}")
-        
-        # ✅ FIX: Check subscription expiry with timezone-aware datetime
+        logger.info(f"Analytics dataset upload initiated by user {current_user.id}: {name}")
+
+        # Subscription check (retained from legacy)
         if current_user.subscription_expires_at:
             now = datetime.now(timezone.utc)
             expiry = current_user.subscription_expires_at
-            
-            # Convert naive datetime to aware if needed
             if expiry.tzinfo is None:
                 expiry = expiry.replace(tzinfo=timezone.utc)
-            
             if expiry < now:
-                logger.warning(f"Upload rejected: subscription expired for user {current_user.id}")
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Subscription expired. Please renew your subscription."
                 )
-        
-        # Validate file extension
-        allowed_extensions = {'.csv', '.xlsx', '.xls', '.json', '.parquet'}
-        file_ext = Path(file.filename).suffix.lower()
-        
-        if file_ext not in allowed_extensions:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"File type {file_ext} not supported. Allowed: {', '.join(allowed_extensions)}"
-            )
-        
-        # Read file content
-        content = await file.read()
-        
-        if not content:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="File is empty"
-            )
-        
-        # Create upload metadata
+
         metadata = DatasetUpload(
             name=name,
             description=description,
         )
-        
-        # Upload dataset via service
+
+        # Enhanced: Pass all four files to the service
         dataset = await dataset_service.upload_dataset(
-            file=file,
             user=current_user,
-            metadata=metadata
+            metadata=metadata,
+            orders_file=orders_file,
+            customers_file=customers_file,
+            products_file=products_file,
+            marketing_file=marketing_file
         )
-        
+
         logger.info(f"Dataset uploaded successfully: {dataset.id}")
-        
+
         return SuccessResponse(
             success=True,
-            message="Dataset uploaded successfully. Processing will begin shortly.",
+            message="Analytics dataset uploaded successfully. Processing will begin shortly.",
             data=DatasetResponse.model_validate(dataset)
         )
-    
+
     except HTTPException:
         raise
     except Exception as e:
@@ -159,7 +114,6 @@ async def upload_dataset(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Upload failed: {str(e)}"
         )
-
 
 # ============================================================
 # LIST DATASETS

@@ -306,7 +306,27 @@ class Dataset(Base, TimestampMixin, SoftDeleteMixin):
         server_default="0",
         comment="Number of times downloaded"
     )
-    
+    orders_path: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        comment="Path to analytics orders csv"
+    )
+    customers_path: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        comment="Path to analytics customers csv"
+    )
+    products_path: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        comment="Path to analytics products csv"
+    )
+    marketing_path: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        comment="Path to analytics marketing csv"
+    )
+
     last_accessed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
@@ -345,11 +365,7 @@ class Dataset(Base, TimestampMixin, SoftDeleteMixin):
             DatasetStatus.CLEANING,
             DatasetStatus.ANALYZING,
         ]
-    
-    def is_ready(self) -> bool:
-        """Check if dataset is ready for analysis."""
-        return self.status == DatasetStatus.COMPLETED
-    
+        
     def has_failed(self) -> bool:
         """Check if dataset processing failed."""
         return self.status == DatasetStatus.FAILED
@@ -374,6 +390,17 @@ class Dataset(Base, TimestampMixin, SoftDeleteMixin):
             f"status={self.status}, rows={self.row_count}, "
             f"cols={self.column_count})"
         )
+    def is_ready(self) -> bool:
+        """
+        Check if all analytic file paths are present for analytics.
+        (Optionally: you may combine with classic status check for backward compatibility)
+        """
+        return all([
+            getattr(self, "orders_path", None),
+            getattr(self, "customers_path", None),
+            getattr(self, "products_path", None),
+            getattr(self, "marketing_path", None)
+        ]) or (self.file_path and self.status == DatasetStatus.COMPLETED)
 
 
 class DatasetStatistics(Base, TimestampMixin):
@@ -588,3 +615,246 @@ class DatasetVisualization(Base, TimestampMixin):
         Index("ix_visualizations_dataset_type", "dataset_id", "chart_type"),
         {"comment": "Generated visualizations for datasets"}
     )
+class CleaningAuditLog(Base, TimestampMixin):
+    """
+    Audit log for data cleaning operations.
+    
+    Tracks detailed history of all cleaning operations performed on datasets
+    including transformations, quality metrics, and configuration used.
+    
+    Attributes:
+        id: Primary key
+        dataset_id: Foreign key to dataset
+        session_id: Unique session identifier for this cleaning operation
+        started_at: When cleaning started
+        completed_at: When cleaning completed
+        duration_seconds: Total processing time
+        status: Operation status (success, failed, partial)
+        config_used: Cleaning configuration that was used
+        original_shape: Original dataset dimensions
+        final_shape: Final dataset dimensions after cleaning
+        rows_removed: Number of rows removed
+        columns_removed: Number of columns removed
+        transformations_applied: List of transformations performed
+        cleaning_steps: Detailed step-by-step log
+        quality_metrics: Quality metrics calculated
+        quality_alerts: Quality alerts generated
+        original_file_path: Path to original file
+        cleaned_file_path: Path to cleaned file
+        error_message: Error message if operation failed
+        user_id: User who initiated the cleaning
+    """
+    
+    __tablename__ = "cleaning_audit_logs"
+    
+    # Primary Key
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+        comment="Audit log unique identifier"
+    )
+    
+    # Dataset Reference
+    dataset_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("datasets.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        comment="Dataset ID this cleaning was performed on"
+    )
+    
+    dataset: Mapped["Dataset"] = relationship(
+        "Dataset",
+        backref="cleaning_audit_logs",
+        lazy="joined",
+    )
+    
+    # Session Identification
+    session_id: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        unique=True,
+        index=True,
+        comment="Unique session ID for this cleaning operation"
+    )
+    
+    # Timing Information
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        index=True,
+        comment="Cleaning start timestamp"
+    )
+    
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Cleaning completion timestamp"
+    )
+    
+    duration_seconds: Mapped[float | None] = mapped_column(
+        Float,
+        nullable=True,
+        comment="Total cleaning duration in seconds"
+    )
+    
+    # Operation Status
+    status: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        index=True,
+        comment="Operation status: success, failed, partial"
+    )
+    
+    # Configuration Used
+    config_used: Mapped[Dict[str, Any] | None] = mapped_column(
+        JSON,
+        nullable=True,
+        comment="Cleaning configuration that was used"
+    )
+    
+    # Data Dimensions
+    original_shape: Mapped[Dict[str, int] | None] = mapped_column(
+        JSON,
+        nullable=True,
+        comment="Original dataset shape (rows, columns)"
+    )
+    
+    final_shape: Mapped[Dict[str, int] | None] = mapped_column(
+        JSON,
+        nullable=True,
+        comment="Final dataset shape after cleaning"
+    )
+    
+    rows_removed: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        comment="Number of rows removed during cleaning"
+    )
+    
+    columns_removed: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        comment="Number of columns removed during cleaning"
+    )
+    
+    # Transformations Applied
+    transformations_applied: Mapped[List[str] | None] = mapped_column(
+        JSON,
+        nullable=True,
+        comment="List of transformation names applied"
+    )
+    
+    cleaning_steps: Mapped[List[Dict[str, Any]] | None] = mapped_column(
+        JSON,
+        nullable=True,
+        comment="Detailed step-by-step cleaning log"
+    )
+    
+    # Quality Metrics
+    quality_metrics: Mapped[Dict[str, Any] | None] = mapped_column(
+        JSON,
+        nullable=True,
+        comment="Quality metrics calculated after cleaning"
+    )
+    
+    quality_alerts: Mapped[List[Dict[str, Any]] | None] = mapped_column(
+        JSON,
+        nullable=True,
+        comment="Quality alerts generated during cleaning"
+    )
+    
+    # File Paths
+    original_file_path: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        comment="Path to original file before cleaning"
+    )
+    
+    cleaned_file_path: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        comment="Path to cleaned file after processing"
+    )
+    
+    # Error Tracking
+    error_message: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Error message if cleaning operation failed"
+    )
+    
+    # User Tracking
+    user_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        comment="User who initiated this cleaning operation"
+    )
+    
+    user: Mapped[Optional["User"]] = relationship(
+        "User",
+        backref="cleaning_operations",
+        lazy="joined",
+    )
+    
+    # Table Constraints
+    __table_args__ = (
+        CheckConstraint(
+            "duration_seconds >= 0",
+            name="duration_non_negative"
+        ),
+        CheckConstraint(
+            "rows_removed >= 0",
+            name="rows_removed_non_negative"
+        ),
+        CheckConstraint(
+            "columns_removed >= 0",
+            name="columns_removed_non_negative"
+        ),
+        Index("ix_cleaning_audit_dataset_status", "dataset_id", "status"),
+        Index("ix_cleaning_audit_started", "started_at"),
+        Index("ix_cleaning_audit_user_dataset", "user_id", "dataset_id"),
+        {"comment": "Audit trail for data cleaning operations"}
+    )
+    
+    # Helper Methods
+    def is_successful(self) -> bool:
+        """Check if cleaning operation was successful."""
+        return self.status == "success"
+    
+    def get_duration_minutes(self) -> float:
+        """Get duration in minutes."""
+        if self.duration_seconds:
+            return round(self.duration_seconds / 60, 2)
+        return 0.0
+    
+    def get_data_reduction_percent(self) -> float:
+        """Calculate percentage of data removed."""
+        if self.original_shape and self.rows_removed:
+            original_rows = self.original_shape.get("rows", 0)
+            if original_rows > 0:
+                return round((self.rows_removed / original_rows) * 100, 2)
+        return 0.0
+    
+    def get_quality_score(self) -> float:
+        """Get overall quality score from metrics."""
+        if self.quality_metrics:
+            return self.quality_metrics.get("overall_score", 0.0)
+        return 0.0
+    
+    def get_quality_grade(self) -> str:
+        """Get quality grade from metrics."""
+        if self.quality_metrics:
+            return self.quality_metrics.get("quality_grade", "N/A")
+        return "N/A"
+    
+    def __repr__(self) -> str:
+        """String representation."""
+        return (
+            f"CleaningAuditLog(id={self.id}, session='{self.session_id}', "
+            f"dataset_id={self.dataset_id}, status={self.status}, "
+            f"duration={self.duration_seconds}s)"
+        )

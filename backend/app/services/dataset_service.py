@@ -82,101 +82,60 @@ class DatasetService:
     
     async def upload_dataset(
         self,
-        file: UploadFile,
         user: User,
-        metadata: DatasetUpload
+        metadata: DatasetUpload,
+        orders_file: UploadFile,
+        customers_file: UploadFile,
+        products_file: UploadFile,
+        marketing_file: UploadFile
     ) -> Dataset:
         """
-        Upload and process a dataset file.
-        
-        Args:
-            file: Uploaded file
-            user: Owner user
-            metadata: Dataset metadata
-            
-        Returns:
-            Created dataset instance
-            
-        Raises:
-            HTTPException: If validation fails or upload errors occur
+        Upload and process four analytics files: orders, customers, products, marketing.
         """
         try:
-            logger.info(f"Starting upload for user {user.id}")
-            
-            # Validate file extension only (don't read yet)
-            self._validate_file(file)
-            
-            # Generate unique file path
-            file_path = self._generate_file_path(user.id, file.filename)
-            
-            # Calculate file hash while saving
-            file_hash = await self._save_file(file, file_path)
-            
-            # Check for duplicate files
-            existing = await self._check_duplicate_file(user.id, file_hash)
-            if existing:
-                # Clean up uploaded file
-                os.remove(file_path)
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"This file already exists as dataset: {existing.name}",
-                )
-            
-            # Extract file metadata
-            file_stats = os.stat(file_path)
-            file_type = self._get_file_extension(file.filename)
-            
-            # Verify file has content
-            if file_stats.st_size == 0:
-                os.remove(file_path)
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="File is empty",
-                )
-            
-            # Create dataset record
-            try:
-                dataset = Dataset(
-                    name=metadata.name,
-                    description=metadata.description,
-                    file_name=file.filename,
-                    file_path=str(file_path),
-                    file_size_bytes=file_stats.st_size,
-                    file_type=file_type,
-                    file_hash=file_hash,
-                    status=DatasetStatus.UPLOADED,
-                    owner_id=user.id,
-                )
-                
-                self.db.add(dataset)
-                
-                # Update user statistics
-                user.datasets_count += 1
-                user.storage_used_bytes += file_stats.st_size
-                
-                self.db.commit()
-                self.db.refresh(dataset)
-                
-                logger.info(f"Dataset {dataset.id} uploaded successfully by user {user.id}")
-                
-                # Trigger async processing
-                self._trigger_dataset_processing(dataset.id)
-                
-                return dataset
-                
-            except IntegrityError as e:
-                self.db.rollback()
-                # Clean up file on error
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                logger.error(f"Database error during upload: {str(e)}")
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to create dataset record",
-                ) from e
-        
-        except HTTPException:
-            raise
+            logger.info(f"Starting multi-file analytics upload for user {user.id}")
+
+            # Save each analytics file and validate
+            orders_path = self._generate_file_path(user.id, orders_file.filename)
+            customers_path = self._generate_file_path(user.id, customers_file.filename)
+            products_path = self._generate_file_path(user.id, products_file.filename)
+            marketing_path = self._generate_file_path(user.id, marketing_file.filename)
+
+            orders_hash = await self._save_file(orders_file, orders_path)
+            customers_hash = await self._save_file(customers_file, customers_path)
+            products_hash = await self._save_file(products_file, products_path)
+            marketing_hash = await self._save_file(marketing_file, marketing_path)
+
+            orders_stats = os.stat(orders_path)
+            # You can also validate file sizes etc. here
+
+            # Create new Dataset record
+            dataset = Dataset(
+                name=metadata.name,
+                description=metadata.description,
+                status=DatasetStatus.UPLOADED,
+                owner_id=user.id,
+                file_name=orders_file.filename,
+                file_path=str(orders_path),        # for legacy/compatibility
+                file_size_bytes=orders_stats.st_size,
+                file_type=self._get_file_extension(orders_file.filename),
+                file_hash=orders_hash,
+                orders_path=str(orders_path),
+                customers_path=str(customers_path),
+                products_path=str(products_path),
+                marketing_path=str(marketing_path),
+            )
+
+            self.db.add(dataset)
+            user.datasets_count += 1
+            user.storage_used_bytes += orders_stats.st_size
+            self.db.commit()
+            self.db.refresh(dataset)
+
+            logger.info(f"Dataset {dataset.id} uploaded successfully by user {user.id}")
+            self._trigger_dataset_processing(dataset.id)
+            return dataset
+
         except Exception as e:
             logger.error(f"Upload failed: {str(e)}", exc_info=True)
             raise HTTPException(

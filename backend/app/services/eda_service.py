@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
 
+import math
 import pandas as pd
 import numpy as np
 from scipy import stats as scipy_stats
@@ -50,6 +51,17 @@ from statsmodels.tsa.stattools import adfuller, acf, pacf
 warnings.filterwarnings('ignore')
 logger = logging.getLogger(__name__)
 
+def sanitize_floats_recursive(obj):
+    if isinstance(obj, float):
+        if math.isinf(obj) or math.isnan(obj):
+            return None
+        return obj
+    elif isinstance(obj, dict):
+        return {k: sanitize_floats_recursive(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_floats_recursive(i) for i in obj]
+    else:
+        return obj
 
 class EDAService:
     """Production-grade EDA service - Part 1 (Features 1-10)."""
@@ -142,115 +154,121 @@ class EDAService:
     # ═══════════════════════════════════════════════════════════
     # FEATURE 2: ADVANCED NUMERICAL STATISTICS
     # ═══════════════════════════════════════════════════════════
-    
+    @staticmethod
+    def _sanitize_float(value):
+        if isinstance(value, float):
+            if math.isinf(value) or math.isnan(value):
+                return None
+        return value
+
     def _get_numerical_statistics(self, df: pd.DataFrame) -> Dict[str, Any]:
         """
-        ✅ FEATURE 2: Advanced Numerical Statistics
-        
-        Comprehensive numerical analysis including:
-        - Central tendency (mean, median, mode)
-        - Dispersion (std, variance, CV, range)
-        - Distribution shape (skewness, kurtosis)
-        - Quartiles and percentiles (5th, 10th, 25th, 50th, 75th, 90th, 95th, 99th)
-        - Outlier detection (IQR method)
-        - Zero value analysis
-        - Extreme value detection
+    ✅ FEATURE 2: Advanced Numerical Statistics
+    
+    Comprehensive numerical analysis including:
+    - Central tendency (mean, median, mode)
+    - Dispersion (std, variance, CV, range)
+    - Distribution shape (skewness, kurtosis)
+    - Quartiles and percentiles (5th, 10th, 25th, 50th, 75th, 90th, 95th, 99th)
+    - Outlier detection (IQR method)
+    - Zero value analysis
+    - Extreme value detection
         """
         numerical_cols = df.select_dtypes(include=[np.number]).columns
-        
+    
         if len(numerical_cols) == 0:
             return {}
-        
+    
         stats_dict = {}
-        
+    
         for col in numerical_cols:
             col_data = df[col].dropna()
-            
+        
             if len(col_data) == 0:
                 stats_dict[col] = {"error": "No non-null values"}
                 continue
-            
+        
             try:
                 # Quartiles
                 Q1 = col_data.quantile(0.25)
                 Q3 = col_data.quantile(0.75)
                 IQR = Q3 - Q1
-                
+            
                 # Outlier bounds
                 lower_bound = Q1 - 1.5 * IQR
                 upper_bound = Q3 + 1.5 * IQR
                 outliers = col_data[(col_data < lower_bound) | (col_data > upper_bound)]
-                
-                # ✅ NEW: Mode calculation
+            
+                # Mode calculation
                 mode_value = col_data.mode()
-                mode = float(mode_value[0]) if len(mode_value) > 0 else None
-                
+                mode =self._sanitize_float(float(mode_value[0])) if len(mode_value) > 0 else None
+            
                 stats_dict[col] = {
                     # Basic stats
                     "count": int(col_data.count()),
                     "missing": int(df[col].isnull().sum()),
                     "missing_percentage": round((df[col].isnull().sum() / len(df)) * 100, 2),
-                    
+                
                     # Central tendency
-                    "mean": float(col_data.mean()),
-                    "median": float(col_data.median()),
+                    "mean": self._sanitize_float(float(col_data.mean())),
+                    "median": self._sanitize_float(float(col_data.median())),
                     "mode": mode,
-                    
+                
                     # Dispersion
-                    "std": float(col_data.std()),
-                    "variance": float(col_data.var()),
-                    "min": float(col_data.min()),
-                    "max": float(col_data.max()),
-                    "range": float(col_data.max() - col_data.min()),
-                    "coefficient_variation": float((col_data.std() / col_data.mean()) * 100) if col_data.mean() != 0 else 0,
-                    
+                    "std":self. _sanitize_float(float(col_data.std())),
+                    "variance": self._sanitize_float(float(col_data.var())),
+                    "min": self._sanitize_float(float(col_data.min())),
+                    "max": self._sanitize_float(float(col_data.max())),
+                    "range": self._sanitize_float(float(col_data.max() - col_data.min())),
+                    "coefficient_variation": self._sanitize_float(float((col_data.std() / col_data.mean()) * 100)) if col_data.mean() != 0 else 0,
+                
                     # Quartiles
-                    "q1": float(Q1),
-                    "q2_median": float(col_data.median()),
-                    "q3": float(Q3),
-                    "iqr": float(IQR),
-                    
-                    # ✅ NEW: Extended percentiles
+                    "q1": self._sanitize_float(float(Q1)),
+                    "q2_median": self._sanitize_float(float(col_data.median())),
+                    "q3": self._sanitize_float(float(Q3)),
+                    "iqr": self._sanitize_float(float(IQR)),
+                
+                    # Extended percentiles
                     "percentiles": {
-                        "p5": float(col_data.quantile(0.05)),
-                        "p10": float(col_data.quantile(0.10)),
-                        "p25": float(Q1),
-                        "p50": float(col_data.median()),
-                        "p75": float(Q3),
-                        "p90": float(col_data.quantile(0.90)),
-                        "p95": float(col_data.quantile(0.95)),
-                        "p99": float(col_data.quantile(0.99)),
+                        "p5": self._sanitize_float(float(col_data.quantile(0.05))),
+                        "p10": self._sanitize_float(float(col_data.quantile(0.10))),
+                        "p25": self._sanitize_float(float(Q1)),
+                        "p50": self._sanitize_float(float(col_data.median())),
+                        "p75": self._sanitize_float(float(Q3)),
+                        "p90": self._sanitize_float(float(col_data.quantile(0.90))),
+                        "p95": self._sanitize_float(float(col_data.quantile(0.95))),
+                        "p99": self._sanitize_float(float(col_data.quantile(0.99))),
                     },
-                    
+                
                     # Distribution shape
-                    "skewness": float(scipy_stats.skew(col_data)),
-                    "kurtosis": float(scipy_stats.kurtosis(col_data)),
+                    "skewness": self._sanitize_float(float(scipy_stats.skew(col_data))),
+                    "kurtosis": self._sanitize_float(float(scipy_stats.kurtosis(col_data))),
                     "skewness_interpretation": self._interpret_skewness(scipy_stats.skew(col_data)),
                     "kurtosis_interpretation": self._interpret_kurtosis(scipy_stats.kurtosis(col_data)),
-                    
+                
                     # Zero analysis
                     "zeros": int((col_data == 0).sum()),
                     "zeros_percentage": round(((col_data == 0).sum() / len(col_data)) * 100, 2),
-                    
+                
                     # Outlier analysis
                     "outliers": int(len(outliers)),
                     "outliers_percentage": round((len(outliers) / len(col_data)) * 100, 2),
-                    "outlier_lower_bound": float(lower_bound),
-                    "outlier_upper_bound": float(upper_bound),
-                    
-                    # ✅ NEW: Extreme values
-                    "min_values": col_data.nsmallest(3).tolist(),
-                    "max_values": col_data.nlargest(3).tolist(),
-                    
-                    # ✅ NEW: Value concentration
+                    "outlier_lower_bound": self._sanitize_float(float(lower_bound)),
+                    "outlier_upper_bound": self._sanitize_float(float(upper_bound)),
+                
+                    # Extreme values
+                    "min_values": [self._sanitize_float(x) for x in col_data.nsmallest(3).tolist()],
+                    "max_values": [self._sanitize_float(x) for x in col_data.nlargest(3).tolist()],
+                
+                    # Value concentration
                     "unique_values": int(col_data.nunique()),
                     "unique_percentage": round((col_data.nunique() / len(col_data)) * 100, 2),
                 }
-                
+            
             except Exception as e:
                 logger.warning(f"⚠️ Error calculating stats for {col}: {e}")
                 stats_dict[col] = {"error": str(e)}
-        
+    
         return stats_dict
     
     def _interpret_skewness(self, skew: float) -> str:
@@ -2778,11 +2796,11 @@ Final Features:
 # ═══════════════════════════════════════════════════════════
 
     async def _generate_profile_report(
-            self,
-            df: pd.DataFrame,
-            dataset: Dataset,
-            minimal: bool = False
-        ) -> str:  # Changed from Optional[str] to str - should never return None
+        self,
+        df: pd.DataFrame,
+        dataset: Dataset,
+        minimal: bool = False
+    ) -> str:
         """
     ✅ FEATURE 24: Enhanced Profile Report Generation
     
@@ -2794,42 +2812,66 @@ Final Features:
         
             logger.info(f"📊 Generating {'minimal' if minimal else 'full'} profile report")
         
-            # Configure profiling
+            # Configure profiling - base configuration
             config = {
                 "title": f"EDA Report: {dataset.name}",
                 "minimal": minimal,
                 "explorative": not minimal,
                 "dark_mode": False,
-                "samples": {"head": 10, "tail": 10},
+                "samples": {
+                    "head": 10,
+                    "tail": 10
+                },
             }
         
             # Reduce processing for large datasets
             if len(df) > 10000:
-                config["samples"] = {"head": 5, "tail": 5}
+                config["samples"] = {
+                    "head": 5,
+                    "tail": 5
+                }
                 config["correlations"] = {
-                    "pearson": {"calculate": True}, 
-                    "spearman": False, 
-                    "kendall": False
+                    "auto": {"calculate": True},
+                    "pearson": {"calculate": True},
+                    "spearman": {"calculate": False},
+                    "kendall": {"calculate": False},
+                    "phi_k": {"calculate": False},
+                    "cramers": {"calculate": False}
                 }
         
+        # For minimal mode, disable expensive computations
             if minimal:
-                config.update({
-                    "correlations": None,
-                    "missing_diagrams": None,
-                    "duplicates": None,
-                    "interactions": None,
-                })
+                config["correlations"] = {
+                    "auto": {"calculate": False},
+                    "pearson": {"calculate": False},
+                    "spearman": {"calculate": False},
+                    "kendall": {"calculate": False},
+                    "phi_k": {"calculate": False},
+                    "cramers": {"calculate": False}
+                }
+                config["missing_diagrams"] = {
+                    "bar": False,
+                    "matrix": False,
+                    "heatmap": False
+                }
+                config["duplicates"] = {
+                    "head": 0
+                }
+                config["interactions"] = {
+                    "continuous": False,
+                    "targets": []
+                }
         
-        # Generate standard profile
+            # Generate standard profile
             profile = ProfileReport(df, **config)
-        
-        # Save standard report
+
+            # Save standard report
             report_path = self._get_report_path(dataset)
             await asyncio.to_thread(profile.to_file, report_path)
         
             logger.info(f"✅ Profile report saved to {report_path}")
-        
-        # Upload to S3 if configured
+
+            # Upload to S3 if configured
             if hasattr(settings, 'USE_S3') and settings.USE_S3:
                 report_url = await self._upload_report_to_s3(report_path, dataset)
                 return report_url
@@ -3980,7 +4022,6 @@ Final Features:
     # ═══════════════════════════════════════════════════════════
     # FEATURE 25: MAIN EDA GENERATION ORCHESTRATOR (ENHANCED)
     # ═══════════════════════════════════════════════════════════
-    
     async def generate_eda_report(
             self,
             dataset_id: int,
@@ -4100,6 +4141,7 @@ Final Features:
                 enhanced_report_url = await self._generate_enhanced_dashboard(statistics, Path(report_url), dataset.name)
         
             clean_statistics = self._convert_numpy_types(statistics)
+            clean_statistics = sanitize_floats_recursive(clean_statistics)
             processing_time = round((datetime.now(timezone.utc) - start_time).total_seconds(), 2)
         
             return {
