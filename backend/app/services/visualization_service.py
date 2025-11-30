@@ -21,6 +21,8 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import matplotlib.pyplot as plt
 import matplotlib
+from collections import defaultdict
+from pathlib import Path
 
 from app.database import get_db
 matplotlib.use('Agg')  # Non-interactive backend for server
@@ -30,6 +32,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.dataset import Dataset, DatasetVisualization
+
 
 logger = logging.getLogger(__name__)
 
@@ -1937,84 +1940,204 @@ class VisualizationService:
     async def generate_dashboard(
         self,
         dataset_id: int,
-        regenerate: bool = False
+        regenerate: bool = False,
     ) -> str:
-        """
-        Generate interactive HTML dashboard with multiple visualizations.
-    
-        Args:
-            dataset_id: Dataset ID to create dashboard for
-            regenerate: Force regenerate all charts if True
-        
+        """Generate an interactive HTML dashboard for a dataset and write it to disk.
+
+        This function:
+        - Validates the dataset and loads the dataframe.
+        - Ensures visualizations exist (optionally regenerating).
+        - Builds the dashboard HTML and writes it to /mnt/data/dashboard_{dataset_id}.html.
+        - Returns the local file path to the generated HTML file so the caller can
+          convert it to a downloadable URL.
+
         Returns:
-            Complete HTML dashboard string with embedded charts
-        
+            str: Absolute local path to the generated dashboard HTML file.
+
         Raises:
-            HTTPException: If dataset not found or generation fails
+            HTTPException on validation/load/generation failures.
         """
         try:
-            # Validate dataset exists and is ready
+            # -----------------------------------------------------------------
+            # 1. Dataset validation
+            # -----------------------------------------------------------------
             dataset = self.db.get(Dataset, dataset_id)
             if not dataset:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Dataset not found"
+                    detail="Dataset not found",
                 )
-        
+
             if not dataset.is_ready():
-               raise HTTPException(
+                raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Dataset not ready. Status: {dataset.status}"
+                    detail=f"Dataset not ready. Status: {dataset.status}",
                 )
-        
-            logger.info(f"Generating dashboard for dataset {dataset_id}")
-        
-            # Load dataframe for analysis
+
+            logger.info("[Dashboard] Starting generation for dataset_id=%s", dataset_id)
+
+            # -----------------------------------------------------------------
+            # 2. Load dataframe *once*
+            # -----------------------------------------------------------------
             df = self._read_dataframe(dataset.file_path, dataset.file_type)
-        
-            # Check if visualizations exist
-            existing_viz = self.db.query(DatasetVisualization).filter(
+            if df is None or df.empty:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Dataset is empty or could not be loaded into a dataframe.",
+                )
+
+            # -----------------------------------------------------------------
+            # 3. Ensure visualizations exist (optionally regenerating)
+            # -----------------------------------------------------------------
+            viz_query = self.db.query(DatasetVisualization).filter(
                 DatasetVisualization.dataset_id == dataset_id
-            ).all()
-        
-            # Generate charts if none exist or regenerate requested
-            if not existing_viz or regenerate:
-                logger.info(f"Generating automated visualizations for dataset {dataset_id}")
-                await self.generate_automated_visualizations(dataset_id, max_charts=10)
-            
-                # Refresh visualizations after generation
-                existing_viz = self.db.query(DatasetVisualization).filter(
+            )
+
+            if hasattr(DatasetVisualization, "is_active"):
+                viz_query = viz_query.filter(DatasetVisualization.is_active.is_(True))
+
+            existing_viz = viz_query.order_by(DatasetVisualization.order).all()
+
+            should_regenerate = regenerate or not existing_viz
+            if should_regenerate:
+                logger.info(
+                    "[Dashboard] (Re)generating automated visualizations for dataset_id=%s",
+                    dataset_id,
+                )
+
+                # Best-effort cleanup of old visualizations if regenerating
+                if existing_viz and regenerate:
+                    for viz in existing_viz:
+                        try:
+                            if getattr(viz, "chart_url", None):
+                                self._safe_remove_chart_file(viz.chart_url)
+                            self.db.delete(viz)
+                        except Exception:
+                            logger.warning(
+                                "[Dashboard] Failed to cleanup old visualization id=%s",
+                                getattr(viz, "id", None),
+                                exc_info=True,
+                            )
+                    self.db.commit()
+
+                max_charts = getattr(self, "dashboard_max_charts", 30)
+                await self.generate_automated_visualizations(
+                    dataset_id=dataset_id,
+                    max_charts=max_charts,
+                )
+
+                # Refresh after generation
+                viz_query = self.db.query(DatasetVisualization).filter(
                     DatasetVisualization.dataset_id == dataset_id
-                ).order_by(DatasetVisualization.order).all()
-        
-            # Calculate data quality score
+                )
+                if hasattr(DatasetVisualization, "is_active"):
+                    viz_query = viz_query.filter(DatasetVisualization.is_active.is_(True))
+
+                existing_viz = viz_query.order_by(DatasetVisualization.order).all()
+
+            if not existing_viz:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=(
+                        "No visualizations are available for this dataset. "
+                        "Automatic visualization generation may have failed."
+                    ),
+                )
+
+            logger.info(
+                "[Dashboard] Using %d visualizations for dataset_id=%s",
+                len(existing_viz),
+                dataset_id,
+            )
+
+            # -----------------------------------------------------------------
+            # 4. Data quality & stats
+            # -----------------------------------------------------------------
             data_quality = self._get_data_quality_score(df)
-        
-            # Generate dashboard statistics
             stats = self._generate_dashboard_stats(df, dataset, data_quality)
-        
-            # Embed all charts into HTML
-            charts_html = self._embed_charts_in_dashboard(existing_viz, dataset_id)
-        
-            # Build complete dashboard HTML
+
+            # Add provenance info so the dashboard knows the source file path
+            # (useful for traceability; this will not break templating)
+            stats.setdefault("source_file_path", dataset.file_path)
+
+            # -----------------------------------------------------------------
+            # 5. Embed charts HTML
+            # -----------------------------------------------------------------
+            charts_html = self._embed_charts_in_dashboard(
+                visualizations=existing_viz,
+                dataset_id=dataset_id,
+            )
+
+            # -----------------------------------------------------------------
+            # 6. Compose final dashboard HTML
+            # -----------------------------------------------------------------
             dashboard_html = self._build_dashboard_html(
                 dataset=dataset,
                 stats=stats,
                 charts_html=charts_html,
-                total_charts=len(existing_viz)
+                total_charts=len(existing_viz),
             )
-        
-            logger.info(f"Successfully generated dashboard with {len(existing_viz)} charts")
-        
-            return dashboard_html
-        
+
+            # -----------------------------------------------------------------
+            # 7. Persist dashboard HTML to disk and return path
+            # -----------------------------------------------------------------
+            # Use /mnt/data for generated artifacts so they are accessible to tooling.
+            base_upload_dir = Path.cwd() / "uploads"/ f"user_{dataset.owner_id}"/ "dashboard_interactive"
+            base_upload_dir.mkdir(parents=True, exist_ok=True)
+
+            out_dir = base_upload_dir
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            safe_name = (
+                Path(dataset.file_name).stem
+                if getattr(dataset, "file_name", None)
+                else f"dataset_{dataset_id}"
+            )
+            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            filename = f"dashboard_{safe_name}_{dataset_id}_{timestamp}.html"
+            output_path = out_dir / filename
+
+            try:
+                # Write the full HTML to disk (UTF-8)
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(dashboard_html)
+            except Exception as io_err:
+                logger.error(
+                    "[Dashboard] Failed to write dashboard HTML to %s: %s",
+                    str(output_path),
+                    str(io_err),
+                    exc_info=True,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to save dashboard file: {str(io_err)}",
+                )
+
+            logger.info(
+                "[Dashboard] Dashboard written to %s for dataset_id=%s",
+                str(output_path),
+                dataset_id,
+            )
+
+            # -----------------------------------------------------------------
+            # 8. Return the local path string so caller can convert to a URL
+            # -----------------------------------------------------------------
+            # Per the system contract, we return the local path (e.g. /mnt/data/...)
+            # and the caller/tooling will transform it into an accessible URL.
+            return str(output_path)
+
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Dashboard generation failed: {str(e)}", exc_info=True)
+            logger.error(
+                "[Dashboard] Generation failed for dataset_id=%s: %s",
+                dataset_id,
+                str(e),
+                exc_info=True,
+            )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Dashboard generation failed: {str(e)}"
+                detail=f"Dashboard generation failed: {str(e)}",
             ) from e
 
 
@@ -2025,210 +2148,432 @@ class VisualizationService:
         charts_html: str,
         total_charts: int
     ) -> str:
-        """Build the complete dashboard HTML structure."""
-    
+        """Build the complete dashboard HTML structure (enterprise style)."""
+
         return f"""<!DOCTYPE html>
-        <html lang="en">
-            <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Dataset Dashboard - {dataset.file_name}</title>
-            <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-            <style>
-                body {{ 
-                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-                    margin: 0; 
-                padding: 20px; 
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dataset Dashboard - {dataset.file_name}</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        :root {{
+            --bg-body: #f4f6f9;
+            --bg-card: #ffffff;
+            --bg-header: #0b1f33;
+            --bg-header-sub: #13283f;
+            --bg-footer: #0b1f33;
+            --border-subtle: #dde3ec;
+            --text-primary: #1f2a3c;
+            --text-secondary: #5f6b7a;
+            --text-muted: #8c98a9;
+            --accent-primary: #1b4f72;
+            --accent-secondary: #2874a6;
+            --accent-soft: #e8f1fb;
+            --badge-ok: #27ae60;
+            --badge-warn: #f39c12;
+            --badge-bad: #c0392b;
+            --shadow-soft: 0 2px 8px rgba(15, 23, 42, 0.08);
+            --shadow-strong: 0 8px 24px rgba(15, 23, 42, 0.15);
+            --radius-card: 10px;
+            --radius-pill: 999px;
+        }}
+
+        * {{
+            box-sizing: border-box;
+        }}
+
+        body {{
+            margin: 0;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+                         Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: var(--bg-body);
+            color: var(--text-primary);
+        }}
+
+        .dashboard-shell {{
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }}
+
+        .top-bar {{
+            background: var(--bg-header);
+            color: #ffffff;
+            padding: 16px 32px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: var(--shadow-strong);
+        }}
+
+        .top-bar-left {{
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }}
+
+        .top-bar-title {{
+            font-size: 20px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+
+        .top-bar-title span.icon {{
+            font-size: 22px;
+        }}
+
+        .top-bar-subtitle {{
+            font-size: 12px;
+            color: rgba(255, 255, 255, 0.8);
+        }}
+
+        .top-bar-meta {{
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+
+        .badge {{
+            display: inline-flex;
+            align-items: center;
+            padding: 4px 10px;
+            border-radius: var(--radius-pill);
+            font-size: 11px;
+            font-weight: 500;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+        }}
+
+        .badge-outline {{
+            background: transparent;
+            color: #ffffff;
+        }}
+
+        .badge-status-ok {{
+            background: rgba(39, 174, 96, 0.18);
+            border-color: rgba(39, 174, 96, 0.6);
+            color: #ecf9f0;
+        }}
+
+        .badge-status-warn {{
+            background: rgba(243, 156, 18, 0.18);
+            border-color: rgba(243, 156, 18, 0.7);
+            color: #fdf5e6;
+        }}
+
+        .badge-status-bad {{
+            background: rgba(192, 57, 43, 0.2);
+            border-color: rgba(192, 57, 43, 0.7);
+            color: #fdecea;
+        }}
+
+        .dashboard-main {{
+            max-width: 1440px;
+            width: 100%;
+            margin: 0 auto;
+            padding: 24px 24px 32px 24px;
+        }}
+
+        .meta-bar {{
+            background: #ffffff;
+            border-radius: var(--radius-card);
+            padding: 12px 18px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: var(--shadow-soft);
+            margin-bottom: 18px;
+            border: 1px solid var(--border-subtle);
+        }}
+
+        .meta-left {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px 16px;
+            font-size: 12px;
+            color: var(--text-muted);
+        }}
+
+        .meta-item span.label {{
+            font-weight: 600;
+            color: var(--text-secondary);
+        }}
+
+        .meta-right {{
+            font-size: 12px;
+            color: var(--text-muted);
+        }}
+
+        .kpi-row {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }}
+
+        .kpi-card {{
+            background: var(--bg-card);
+            border-radius: var(--radius-card);
+            padding: 16px 18px;
+            box-shadow: var(--shadow-soft);
+            border: 1px solid var(--border-subtle);
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            min-height: 110px;
+        }}
+
+        .kpi-label {{
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-muted);
+            font-weight: 600;
+            margin-bottom: 6px;
+        }}
+
+        .kpi-value {{
+            font-size: 24px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 4px;
+        }}
+
+        .kpi-subvalue {{
+            font-size: 12px;
+            color: var(--text-secondary);
+        }}
+
+        .quality-wrapper {{
+            margin-top: 6px;
+        }}
+
+        .quality-bar {{
+            width: 100%;
+            height: 7px;
+            background: #eef2f7;
+            border-radius: 999px;
+            overflow: hidden;
+        }}
+
+        .quality-fill {{
+            height: 100%;
+            background: linear-gradient(90deg, #1b4f72, #27ae60);
+            border-radius: 999px;
+            transition: width 0.45s ease;
+        }}
+
+        .dashboard-section {{
+            margin-top: 8px;
+        }}
+
+        .section-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }}
+
+        .section-title {{
+            font-size: 15px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+
+        .section-title::before {{
+            content: "";
+            display: inline-block;
+            width: 6px;
+            height: 18px;
+            border-radius: 999px;
+            background: linear-gradient(180deg, #1b4f72, #2874a6);
+        }}
+
+        .section-meta {{
+            font-size: 12px;
+            color: var(--text-muted);
+        }}
+
+        .chart-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(480px, 1fr));
+            gap: 18px;
+        }}
+
+        .chart-card {{
+            background: var(--bg-card);
+            border-radius: var(--radius-card);
+            box-shadow: var(--shadow-soft);
+            border: 1px solid var(--border-subtle);
+            padding: 14px 16px 16px 16px;
+            display: flex;
+            flex-direction: column;
+        }}
+
+        .chart-card-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            margin-bottom: 10px;
+        }}
+
+        .chart-card-title {{
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }}
+
+        .chart-card-subtitle {{
+            font-size: 11px;
+            color: var(--text-muted);
+        }}
+
+        .chart-frame {{
+            width: 100%;
+            border: none;
+            min-height: 380px;
+        }}
+
+        /* If charts_html already has its own .chart structure, we just host it */
+        .charts-wrapper {{
+            width: 100%;
+        }}
+
+        .no-charts {{
+            background: var(--bg-card);
+            border-radius: var(--radius-card);
+            padding: 32px;
+            text-align: center;
+            box-shadow: var(--shadow-soft);
+            border: 1px solid var(--border-subtle);
+            color: var(--text-secondary);
+            font-size: 14px;
+        }}
+
+        .footer {{
+            margin-top: auto;
+            background: var(--bg-footer);
+            color: rgba(255, 255, 255, 0.75);
+            font-size: 12px;
+            padding: 10px 24px;
+            text-align: center;
+        }}
+
+        @media (max-width: 768px) {{
+            .top-bar {{
+                padding: 12px 16px;
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 8px;
             }}
-            .container {{ 
-                max-width: 1400px; 
-                margin: 0 auto; 
+
+            .dashboard-main {{
+                padding: 16px;
             }}
-            .header {{ 
-                background: linear-gradient(135deg, #2c3e50 0%, #34495e 100%);
-                color: white; 
-                padding: 30px; 
-                border-radius: 12px; 
-                margin-bottom: 25px;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+
+            .meta-bar {{
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 8px;
             }}
-            .header h1 {{ 
-                margin: 0 0 10px 0; 
-                font-size: 32px;
-                font-weight: 600;
-            }}
-            .header-subtitle {{
-                font-size: 14px;
-                opacity: 0.9;
-                margin-top: 8px;
-            }}
-            .stats {{ 
-                display: grid; 
-                grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); 
-                gap: 20px; 
-                margin-bottom: 25px; 
-            }}
-            .stat-card {{ 
-                background: white; 
-                padding: 25px; 
-                border-radius: 12px; 
-                box-shadow: 0 4px 15px rgba(0,0,0,0.15);
-                border-left: 5px solid #3498db;
-                transition: transform 0.2s, box-shadow 0.2s;
-            }}
-            .stat-card:hover {{
-                transform: translateY(-5px);
-                box-shadow: 0 8px 25px rgba(0,0,0,0.2);
-            }}
-            .stat-label {{ 
-                color: #7f8c8d; 
-                font-size: 13px; 
-                font-weight: 600;
-                text-transform: uppercase;
-                letter-spacing: 0.5px;
-                margin-bottom: 8px;
-            }}
-            .stat-value {{ 
-                font-size: 28px; 
-                font-weight: bold; 
-                color: #2c3e50;
-                margin: 5px 0;
-            }}
-            .stat-subvalue {{
-                font-size: 12px;
-                color: #95a5a6;
-                margin-top: 5px;
-            }}
-            .quality-bar {{
-                width: 100%;
-                height: 8px;
-                background: #ecf0f1;
-                border-radius: 4px;
-                margin-top: 10px;
-                overflow: hidden;
-            }}
-            .quality-fill {{
-                height: 100%;
-                background: linear-gradient(90deg, #3498db 0%, #2ecc71 100%);
-                border-radius: 4px;
-                transition: width 0.5s ease;
-            }}
-            .grid {{ 
-                display: grid; 
-                grid-template-columns: repeat(auto-fit, minmax(500px, 1fr)); 
-                gap: 25px; 
-            }}
-            .chart {{ 
-                background: white; 
-                padding: 25px; 
-                border-radius: 12px; 
-                box-shadow: 0 4px 15px rgba(0,0,0,0.15);
-                transition: transform 0.2s, box-shadow 0.2s;
-            }}
-            .chart:hover {{
-                transform: translateY(-3px);
-                box-shadow: 0 8px 25px rgba(0,0,0,0.2);
-            }}
-            .chart-title {{
-                font-size: 18px;
-                font-weight: 600;
-                color: #2c3e50;
-                margin-bottom: 15px;
-                padding-bottom: 10px;
-                border-bottom: 2px solid #ecf0f1;
-            }}
-            .chart-container {{
-                width: 100%;
-                overflow: hidden;
-            }}
-            .chart-container iframe {{
-                width: 100%;
-                border: none;
-                min-height: 400px;
-            }}
-            .no-charts {{
-                background: white;
-                padding: 40px;
-                border-radius: 12px;
-                text-align: center;
-                box-shadow: 0 4px 15px rgba(0,0,0,0.15);
-            }}
-            .loading-spinner {{
-                display: inline-block;
-                width: 40px;
-                height: 40px;
-                border: 4px solid #f3f3f3;
-                border-top: 4px solid #3498db;
-                border-radius: 50%;
-                animation: spin 1s linear infinite;
-            }}
-            @keyframes spin {{
-                0% {{ transform: rotate(0deg); }}
-                100% {{ transform: rotate(360deg); }}
-            }}
-            .footer {{
-                margin-top: 30px;
-                padding: 20px;
-                background: rgba(255,255,255,0.1);
-                border-radius: 12px;
-                text-align: center;
-                color: white;
-                font-size: 13px;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>📊 {dataset.file_name} Dashboard</h1>
-                <div class="header-subtitle">
-                    Dataset ID: {dataset.id} | Status: {dataset.status.value if hasattr(dataset.status, 'value') else dataset.status} | 
-                    Charts: {total_charts}
+        }}
+    </style>
+</head>
+<body>
+    <div class="dashboard-shell">
+        <header class="top-bar">
+            <div class="top-bar-left">
+                <div class="top-bar-title">
+                    <span class="icon">📊</span>
+                    <span>{dataset.file_name} Dashboard</span>
+                </div>
+                <div class="top-bar-subtitle">
+                    Dataset ID: {dataset.id} · Status: {dataset.status.value if hasattr(dataset.status, 'value') else dataset.status}
                 </div>
             </div>
-        
-            <div class="stats">
-                <div class="stat-card">
-                    <div class="stat-label">📋 Total Rows</div>
-                    <div class="stat-value">{stats['total_rows']:,}</div>
-                    <div class="stat-subvalue">Data records</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">📊 Total Columns</div>
-                    <div class="stat-value">{stats['total_columns']}</div>
-                    <div class="stat-subvalue">{stats['numerical_cols']} numerical, {stats['categorical_cols']} categorical</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">✅ Data Quality</div>
-                    <div class="stat-value">{stats['quality_score']:.1f}%</div>
-                    <div class="quality-bar">
-                        <div class="quality-fill" style="width: {stats['quality_score']}%"></div>
+            <div class="top-bar-meta">
+                <span class="badge badge-outline">Charts: {total_charts}</span>
+            </div>
+        </header>
+
+        <main class="dashboard-main">
+            <section class="meta-bar">
+                <div class="meta-left">
+                    <div class="meta-item">
+                        <span class="label">Rows:</span> {stats['total_rows']:,}
+                    </div>
+                    <div class="meta-item">
+                        <span class="label">Columns:</span> {stats['total_columns']}
+                        &nbsp;({stats['numerical_cols']} numerical, {stats['categorical_cols']} categorical)
+                    </div>
+                    <div class="meta-item">
+                        <span class="label">Memory:</span> {stats['memory_size']}
                     </div>
                 </div>
-                <div class="stat-card">
-                    <div class="stat-label">💾 Memory Size</div>
-                    <div class="stat-value">{stats['memory_size']}</div>
-                    <div class="stat-subvalue">Dataset footprint</div>
+                <div class="meta-right">
+                    Last updated: {stats['last_updated']}
                 </div>
-                <div class="stat-card">
-                    <div class="stat-label">🕒 Last Updated</div>
-                    <div class="stat-value" style="font-size: 18px;">{stats['last_updated']}</div>
-                    <div class="stat-subvalue">Processing completed</div>
+            </section>
+
+            <section class="kpi-row">
+                <div class="kpi-card">
+                    <div class="kpi-label">Total Rows</div>
+                    <div class="kpi-value">{stats['total_rows']:,}</div>
+                    <div class="kpi-subvalue">Data records ingested</div>
                 </div>
-            </div>
-        
-            <div class="grid">
-                {charts_html}
-            </div>
-        
-            <div class="footer">
-                Generated by DataSense Visualization Service | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-            </div>
-        </div>
-    </body>
-    </html>
-    """
+                <div class="kpi-card">
+                    <div class="kpi-label">Total Columns</div>
+                    <div class="kpi-value">{stats['total_columns']}</div>
+                    <div class="kpi-subvalue">
+                        {stats['numerical_cols']} numerical · {stats['categorical_cols']} categorical
+                    </div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Data Quality Score</div>
+                    <div class="kpi-value">{stats['quality_score']:.1f}%</div>
+                    <div class="quality-wrapper">
+                        <div class="quality-bar">
+                            <div class="quality-fill" style="width: {stats['quality_score']}%"></div>
+                        </div>
+                        <div class="kpi-subvalue">
+                            Completeness, consistency & type integrity
+                        </div>
+                    </div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Dataset Footprint</div>
+                    <div class="kpi-value">{stats['memory_size']}</div>
+                    <div class="kpi-subvalue">In-memory size estimate</div>
+                </div>
+            </section>
+
+            <section class="dashboard-section">
+                <div class="section-header">
+                    <div class="section-title">Visual Analytics</div>
+                    <div class="section-meta">
+                        Rendering {total_charts} chart{'' if total_charts == 1 else 's'} for this dataset
+                    </div>
+                </div>
+
+                <div class="charts-wrapper">
+                    {"<div class='no-charts'>No charts available for this dataset.</div>" if not charts_html else charts_html}
+                </div>
+            </section>
+        </main>
+
+        <footer class="footer">
+            Generated by DataSense Visualization Service · {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        </footer>
+    </div>
+</body>
+</html>
+"""
 
 
 # ============================================================
@@ -2268,115 +2613,260 @@ class VisualizationService:
             )
     
         return fig
+    
     def _embed_charts_in_dashboard(
         self,
         visualizations: List[DatasetVisualization],
         dataset_id: int
     ) -> str:
         """
-        Embed saved chart HTML files into dashboard grid.
-    
-        Args:
-            visualizations: List of DatasetVisualization objects
-            dataset_id: Dataset ID for error handling
-        
-        Returns:
-            HTML string with all embedded charts
+    Build the dashboard body by scanning ALL chart HTML files and grouping them by type.
+
+    - Ignores DB `visualizations` list for file resolution.
+    - Uses uploads/user_10/charts/*.html as the source of truth.
+    - Groups charts into logical sections (Distribution, Categorical, Heatmaps, etc.).
+    - Renders a left navigation sidebar to jump between sections.
         """
-        if not visualizations:
+
+        # ------------------------------------------------------------------
+        # 1. Locate all chart HTML files
+        # ------------------------------------------------------------------
+        project_root = Path.cwd()  # e.g. D:\Datasense\backend
+        charts_dir = project_root / "uploads" / "user_10" / "charts"
+
+        if not charts_dir.exists():
+            logger.error(f"[Dashboard] Charts directory does not exist: {charts_dir}")
             return """
-            <div class="no-charts">
-                <div class="loading-spinner"></div>
-                <h3 style="margin-top: 20px; color: #7f8c8d;">No Visualizations Available</h3>
-                <p style="color: #95a5a6;">Generate visualizations from the API to populate this dashboard.</p>
-            </div>
+        <div class="no-charts">
+            <h3 style="margin-top: 20px; color: var(--text-secondary);">
+                No chart files found
+            </h3>
+        </div>
             """
-    
-        charts_html = []
-    
-        for viz in visualizations:
-            try:
-                chart_path = Path(viz.chart_url)
-            
-                if not chart_path.exists():
-                    logger.warning(f"Chart file not found: {chart_path}")
-                    charts_html.append(f"""
-                    <div class="chart">
-                        <div class="chart-title">{viz.title}</div>
-                        <div class="chart-container">
-                            <p style="color: #e74c3c; text-align: center; padding: 40px;">
-                                ⚠️ Chart file not found
-                            </p>
+
+        html_files = list(charts_dir.glob("*.html"))
+
+        if not html_files:
+            logger.warning(f"[Dashboard] No .html charts found in {charts_dir}")
+            return """
+        <div class="no-charts">
+            <h3 style="margin-top: 20px; color: var(--text-secondary);">
+                No chart files found
+            </h3>
+        </div>
+            """
+
+    # Sort newest → oldest for nicer viewing
+        html_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        logger.info(f"[Dashboard] Embedding {len(html_files)} chart files from {charts_dir}")
+
+    # ------------------------------------------------------------------
+    # 2. Group charts by inferred type based on filename
+    # ------------------------------------------------------------------
+        def infer_group_name(path: Path) -> str:
+            name = path.stem.lower()
+
+            if name.startswith("dist_") or "hist" in name:
+                return "Distributions"
+            if name.startswith("cat_"):
+                return "Categorical / Segment"
+            if "heatmap" in name or "corr" in name or "correlation" in name:
+                return "Heatmaps & Correlations"
+            if name.startswith("box") or "box_plot" in name:
+                return "Box Plots"
+            if "scatter" in name:
+                return "Scatter Plots"
+            if "time" in name or "ts_" in name:
+                return "Time Series"
+            return "Other Analytics"
+
+        grouped_files: Dict[str, List[Path]] = defaultdict(list)
+        for f in html_files:
+            group = infer_group_name(f)
+            grouped_files[group].append(f)
+
+        # Stable group order
+        group_order = [
+            "Distributions",
+            "Categorical / Segment",
+            "Heatmaps & Correlations",
+            "Box Plots",
+            "Scatter Plots",
+            "Time Series",
+            "Other Analytics",
+        ]
+
+        # ------------------------------------------------------------------
+        # 3. Build sidebar navigation
+        # ------------------------------------------------------------------
+        def slugify(label: str) -> str:
+            return (
+                label.lower()
+                .replace("&", "and")
+                .replace("/", " ")
+                .replace("  ", " ")
+                .strip()
+                .replace(" ", "-")
+            )
+
+        sidebar_items = []
+        for group in group_order:
+            files = grouped_files.get(group, [])
+            if not files:
+                continue
+
+            section_id = f"section-{slugify(group)}"
+            count = len(files)
+            sidebar_items.append(f"""
+        <li class="sidebar-item">
+            <a href="#{section_id}" class="sidebar-link">
+                <span class="sidebar-label">{group}</span>
+                <span class="sidebar-badge">{count}</span>
+            </a>
+        </li>
+            """)
+
+        sidebar_html = f"""
+    <nav class="dashboard-sidebar">
+        <div class="sidebar-title">Views</div>
+        <ul class="sidebar-nav">
+            {''.join(sidebar_items)}
+        </ul>
+    </nav>
+        """
+
+    # ------------------------------------------------------------------
+    # 4. Build grouped chart sections
+    # ------------------------------------------------------------------
+        sections_html = []
+
+        file_counter = 1
+        for group in group_order:
+            files = grouped_files.get(group, [])
+            if not files:
+                continue
+
+            section_id = f"section-{slugify(group)}"
+
+            cards_html = []
+            for chart_file in files:
+                try:
+                    with open(chart_file, "r", encoding="utf-8") as f:
+                        raw_html = f.read()
+
+                    chart_content = self._extract_plotly_content(raw_html)
+
+                    display_name = chart_file.stem
+
+                    cards_html.append(f"""
+                    <div class="chart-card">
+                        <div class="chart-card-header">
+                            <div class="chart-card-title">{display_name}</div>
+                            <div class="chart-card-subtitle">File {file_counter}</div>
+                        </div>
+                        <div>
+                            {chart_content}
                         </div>
                     </div>
                     """)
-                    continue
-            
-                # Read chart HTML content
-                with open(chart_path, 'r', encoding='utf-8') as f:
-                    chart_html = f.read()
-            
-                # Extract only the Plotly div and script (remove full HTML wrapper)
-                # This prevents duplicate HTML structure
-                chart_content = self._extract_plotly_content(chart_html)
-            
-                charts_html.append(f"""
-                <div class="chart">
-                    <div class="chart-title">{viz.title}</div>
-                    <div class="chart-container">
-                        {chart_content}
+
+                except Exception as e:
+                    logger.error(
+                        f"[Dashboard] Failed to embed chart file {chart_file}: {e}",
+                        exc_info=True
+                    )
+                    cards_html.append(f"""
+                    <div class="chart-card">
+                        <div class="chart-card-header">
+                            <div class="chart-card-title">{chart_file.stem}</div>
+                            <div class="chart-card-subtitle">File {file_counter}</div>
+                        </div>
+                        <div style="padding: 40px; text-align:center; color:#c0392b;">
+                            ❌ Error rendering chart<br>
+                            <small>{str(e)}</small>
+                        </div>
                     </div>
+                    """)
+                finally:
+                    file_counter += 1
+
+            sections_html.append(f"""
+            <section id="{section_id}" class="chart-section">
+                <div class="chart-section-header">
+                    <h2 class="chart-section-title">{group}</h2>
+                    <span class="chart-section-count">{len(files)} charts</span>
                 </div>
-                """)
-            
-            except Exception as e:
-                logger.error(f"Failed to embed chart {viz.id}: {str(e)}")
-                charts_html.append(f"""
-                <div class="chart">
-                    <div class="chart-title">{viz.title}</div>
-                    <div class="chart-container">
-                        <p style="color: #e74c3c; text-align: center; padding: 40px;">
-                            ❌ Error loading chart: {str(e)}
-                        </p>
-                    </div>
+                <div class="charts-grid">
+                    {''.join(cards_html)}
                 </div>
-                """)
-    
-        return "\n".join(charts_html)
+            </section>
+            """)
+
+        content_html = "\n".join(sections_html)
+
+        # ------------------------------------------------------------------
+        # 5. Wrap sidebar + content into a layout shell
+        # ------------------------------------------------------------------
+        dashboard_body = f"""
+        <div class="dashboard-layout">
+            {sidebar_html}
+            <div class="dashboard-main">
+                {content_html}
+            </div>
+        </div>
+        """
+
+        return dashboard_body
 
 
     def _extract_plotly_content(self, full_html: str) -> str:
         """
-        Extract only the Plotly div and script from full HTML.
-    
-        Args:
-            full_html: Complete HTML string with Plotly chart
-        
-        Returns:
-            Cleaned HTML with just the chart div and script
+    Robust Plotly extractor.
+    Pulls out the primary <div> + ALL <script> blocks needed to render the chart.
+    Works for any Plotly standalone HTML file.
         """
+        import re
+
         try:
-            # Try to extract just the plot div
-            import re
-        
-            # Find the Plotly div
-            div_match = re.search(r'<div id=["\']([^"\']+)["\'][^>]*>.*?</div>', full_html, re.DOTALL)
-        
-            # Find the Plotly script
-            script_match = re.search(
-                r'<script[^>]*>.*?Plotly\.newPlot.*?</script>',
+            # 1. Extract first Plotly <div>
+            divs = re.findall(
+                r'<div[^>]*plotly[^>]*>.*?</div>',
                 full_html,
-                re.DOTALL
+                flags=re.DOTALL | re.IGNORECASE
             )
-        
-            if div_match and script_match:
-                return div_match.group(0) + "\n" + script_match.group(0)
-            else:
-                # Fallback: use iframe embedding
-                return full_html
-            
+            if not divs:
+                # fallback: first div
+                divs = re.findall(
+                    r'<div[^>]*>.*?</div>',
+                    full_html,
+                    flags=re.DOTALL | re.IGNORECASE
+                )
+            if not divs:
+                return "<!-- No Plotly DIV found -->"
+
+            plot_div = divs[0]
+
+            # 2. Extract ALL <script> tags (Plotly uses multiple)
+            scripts = re.findall(
+                r'<script[^>]*>.*?</script>',
+                full_html,
+                flags=re.DOTALL | re.IGNORECASE
+            )
+
+            # Filter only scripts containing Plotly calls
+            plot_scripts = [
+                s for s in scripts
+                if ("Plotly" in s or "plotly" in s or "PLOTLYENV" in s)
+            ]
+
+            if not plot_scripts:
+                # fallback: return all scripts
+                plot_scripts = scripts
+
+            return plot_div + "\n" + "\n".join(plot_scripts)
+
         except Exception as e:
-            logger.warning(f"Could not extract Plotly content: {str(e)}, using full HTML")
+            logger.error(f"[Extractor] Failed to parse Plotly HTML: {e}", exc_info=True)
             return full_html
 
 
