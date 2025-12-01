@@ -23,6 +23,12 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # ENGINE CONFIGURATION
 # ============================================================
+# ⛔ SAFETY BLOCK: Never allow SQLite in production
+if settings.is_production and settings.DATABASE_URL.startswith("sqlite"):
+    raise RuntimeError(
+        "❌ FATAL: SQLite detected in production! "
+        "Set DATABASE_URL to your Render PostgreSQL database."
+    )
 
 def get_engine_args() -> dict:
     """
@@ -408,8 +414,13 @@ def startup_db() -> None:
     
     # Log database info
     db_info = get_db_info()
-    logger.info(f"Connected to {db_info['drivername']} database: {db_info['database']}")
-    
+    logger.info(
+    f"✅ Database connected | "
+    f"Driver: {db_info['drivername']} | "
+    f"Host: {db_info['host']} | "
+    f"DB: {db_info['database']}"
+)
+
     # Log pool status if available
     pool_status = get_pool_status()
     if pool_status:
