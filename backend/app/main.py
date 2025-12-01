@@ -105,9 +105,13 @@ logger.info("✅ GZip compression configured")
 if settings.is_production:
     app.add_middleware(
         TrustedHostMiddleware,
-        allowed_hosts=settings.BACKEND_CORS_ORIGINS
+        allowed_hosts=[
+            "localhost",
+            "datasense-sj97.onrender.com",  # ✅ YOUR REAL DOMAIN
+            "*.onrender.com"               # ✅ ALL RENDER SUBDOMAINS
+        ]
     )
-    logger.info("✅ TrustedHost configured")
+    logger.info("✅ TrustedHost configured for Render")
 
 # ============================================================
 # CUSTOM MIDDLEWARE
