@@ -334,25 +334,18 @@ def receive_after_rollback(session):
 
 def get_pool_status() -> Optional[dict]:
     """
-    Get current connection pool status.
-    
-    Returns:
-        Dictionary with pool statistics or None if not applicable
-        
-    Example:
-        from app.database import get_pool_status
-        status = get_pool_status()
-        if status:
-            print(f"Active connections: {status['checked_out']}")
+    Get current connection pool status (SQLAlchemy 2.x safe).
     """
-    if hasattr(engine.pool, 'size'):
+    pool = engine.pool
+
+    try:
         return {
-            "pool_size": engine.pool.size(),
-            "checked_out": engine.pool.checked_out(),
-            "overflow": engine.pool.overflow(),
-            "checked_in": engine.pool.size() - engine.pool.checked_out(),
+            "pool_size": getattr(pool, "size", lambda: None)(),
+            "checked_out": getattr(pool, "checkedout", lambda: None)(),
+            "overflow": getattr(pool, "_overflow", None),
         }
-    return None
+    except Exception:
+        return None
 
 
 # ============================================================
